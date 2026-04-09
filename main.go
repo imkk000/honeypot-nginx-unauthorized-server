@@ -41,7 +41,7 @@ func main() {
 	e.Use(
 		middleware.Recover(),
 		middlewareSetServerHeader,
-		middlewareNoFavicon,
+		middlewareNotFound,
 		middlewareRequestID,
 		middlewareRequestLogger(),
 		middlewareBasicAuth(),

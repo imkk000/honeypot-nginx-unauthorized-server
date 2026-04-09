@@ -13,7 +13,7 @@ import (
 )
 
 func ipExtractor(req *http.Request) string {
-	if ip := req.Header.Get("CF-Connecting-IP"); ip != "" {
+	if ip := req.Header.Get("Cf-Connecting-Ip"); ip != "" {
 		return ip
 	}
 	return echo.ExtractIPDirect()(req)
@@ -37,13 +37,12 @@ func errorHandler(c *echo.Context, err error) {
 func middlewareRequestID(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		id := uuid.Must(uuid.NewV7()).String()
-		c.Set("request_id", id)
 		c.Request().Header.Set(echo.HeaderXRequestID, id)
 		return next(c)
 	}
 }
 
-func middlewareNoFavicon(next echo.HandlerFunc) echo.HandlerFunc {
+func middlewareNotFound(next echo.HandlerFunc) echo.HandlerFunc {
 	return func(c *echo.Context) error {
 		path := c.Request().URL.Path
 		for _, prefix := range skip {
@@ -59,58 +58,75 @@ func middlewareRequestLogger() echo.MiddlewareFunc {
 	logHeaderGroup := func(headers http.Header) slog.Attr {
 		result := make([]slog.Attr, 0, len(headers))
 		for key := range headers {
-			if strings.HasPrefix(key, "CF-") {
+			overrideHeader, ok := keepHeaders[key]
+			if !ok {
 				continue
 			}
-			value := headers.Get(key)
-
+			value, ok := validateHeader(headers.Get(key))
+			if ok && overrideHeader != nil {
+				value = overrideHeader(value)
+			}
 			result = append(result, slog.String(key, value))
+		}
+		if len(result) == 0 {
+			return slog.Attr{}
 		}
 		return slog.GroupAttrs("headers", result...)
 	}
+	logAuthGroup := func(c *echo.Context) slog.Attr {
+		authCtx := c.Get("authctx")
+		if authCtx == nil {
+			return slog.Attr{}
+		}
+		v, ok := authCtx.(AuthContext)
+		if !ok || !v.IsAttempted() {
+			return slog.Attr{}
+		}
+		return slog.GroupAttrs("auth",
+			slog.String("user", v.Username),
+			slog.String("pass", v.Password),
+		)
+	}
 
 	return middleware.RequestLoggerWithConfig(middleware.RequestLoggerConfig{
-		LogLatency:       true,
-		LogRemoteIP:      true,
-		LogHost:          true,
-		LogMethod:        true,
-		LogURI:           true,
-		LogRequestID:     true,
-		LogStatus:        true,
-		LogContentLength: true,
-		LogResponseSize:  true,
-		HandleError:      true,
+		LogLatency:   true,
+		LogRemoteIP:  true,
+		LogHost:      true,
+		LogMethod:    true,
+		LogURI:       true,
+		LogRequestID: true,
+		LogStatus:    true,
+		HandleError:  true,
 		LogValuesFunc: func(c *echo.Context, v middleware.RequestLoggerValues) error {
-			country := c.Request().Header.Get("CF-IPCountry")
+			country := c.Request().Header.Get("Cf-IPCountry")
+			cfRay := c.Request().Header.Get("Cf-Ray")
 			logger := c.Logger()
 			if v.Error == nil {
 				logger.LogAttrs(context.Background(), slog.LevelInfo, "request",
+					slog.String("request_id", v.RequestID),
 					slog.String("method", v.Method),
 					slog.String("uri", v.URI),
 					slog.Int("status", v.Status),
 					slog.Duration("latency", v.Latency),
-					slog.String("host", v.Host),
-					slog.String("bytes_in", v.ContentLength),
-					slog.Int64("bytes_out", v.ResponseSize),
-					slog.String("country", country),
 					slog.String("remote_ip", v.RemoteIP),
-					slog.String("request_id", v.RequestID),
+					slog.String("cf_country", country),
+					slog.String("cf_ray", cfRay),
+					logAuthGroup(c),
 					logHeaderGroup(c.Request().Header),
 				)
 				return nil
 			}
 
 			logger.LogAttrs(context.Background(), slog.LevelError, "request_error",
+				slog.String("request_id", v.RequestID),
 				slog.String("method", v.Method),
 				slog.String("uri", v.URI),
 				slog.Int("status", v.Status),
 				slog.Duration("latency", v.Latency),
-				slog.String("host", v.Host),
-				slog.String("bytes_in", v.ContentLength),
-				slog.Int64("bytes_out", v.ResponseSize),
-				slog.String("country", country),
 				slog.String("remote_ip", v.RemoteIP),
-				slog.String("request_id", v.RequestID),
+				slog.String("cf_country", country),
+				slog.String("cf_ray", cfRay),
+				logAuthGroup(c),
 				logHeaderGroup(c.Request().Header),
 
 				slog.String("error", v.Error.Error()),
@@ -124,9 +140,10 @@ func middlewareBasicAuth() echo.MiddlewareFunc {
 	cfg := middleware.BasicAuthConfig{
 		Realm: realm,
 		Validator: func(c *echo.Context, user, password string) (bool, error) {
-			if user != "" || password != "" {
-				c.Logger().Info("login", "user", user, "pass", password, "request_id", c.Get("request_id"))
-			}
+			c.Set("authctx", AuthContext{
+				Username: user,
+				Password: password,
+			})
 			return false, nil
 		},
 	}
@@ -161,4 +178,65 @@ var skip = []string{
 	"/.well-known",
 	"/robots.txt",
 	"/sitemap.xml",
+}
+
+var (
+	keepHeaders = map[string]func(string) string{
+		"Content-Type": func(v string) string {
+			if idx := strings.Index(v, ";"); idx != -1 {
+				return v[:idx]
+			}
+			return v
+		},
+		"Accept-Language": func(v string) string {
+			if idx := strings.Index(v, ","); idx != -1 {
+				return v[:idx]
+			}
+			return v
+		},
+		"Cookie": func(v string) string {
+			parts := strings.Split(v, ";")
+			if len(parts) > 20 {
+				return "[TOO_MANY]"
+			}
+			var names []string
+			for _, part := range parts {
+				part = strings.TrimSpace(part)
+				if part == "" {
+					continue
+				}
+				if idx := strings.Index(part, "="); idx != -1 {
+					name := strings.TrimSpace(part[:idx])
+					if name != "" {
+						names = append(names, name)
+					}
+				}
+			}
+			if len(names) == 0 {
+				return "[MALFORMED]"
+			}
+			return strings.Join(names, ";")
+		},
+		"User-Agent":      nil,
+		"Authorization":   nil,
+		"X-Forwarded-For": nil,
+	}
+	validateHeader = func(v string) (string, bool) {
+		if len(v) == 0 {
+			return "[EMPTY]", false
+		}
+		if len(v) > 1024 {
+			return "[TOO_LONG]", false
+		}
+		return v, true
+	}
+)
+
+type AuthContext struct {
+	Username string
+	Password string
+}
+
+func (a AuthContext) IsAttempted() bool {
+	return a.Username != "" || a.Password != ""
 }

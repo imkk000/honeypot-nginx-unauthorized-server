@@ -62,7 +62,7 @@ func middlewareRequestLogger() echo.MiddlewareFunc {
 			if !ok {
 				continue
 			}
-			value, ok := validateHeader(headers.Get(key))
+			value, ok := sanitizeHeader(headers.Get(key))
 			if ok && overrideHeader != nil {
 				value = overrideHeader(value)
 			}
@@ -221,7 +221,7 @@ var (
 		"Authorization":   nil,
 		"X-Forwarded-For": nil,
 	}
-	validateHeader = func(v string) (string, bool) {
+	sanitizeHeader = func(v string) (string, bool) {
 		if len(v) == 0 {
 			return "[EMPTY]", false
 		}

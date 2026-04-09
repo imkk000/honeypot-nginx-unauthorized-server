@@ -1,0 +1,7 @@
+*
+!*.go
+!*.mod
+!*.sum
+!README.md
+!.gitignore
+!taskfile.yaml

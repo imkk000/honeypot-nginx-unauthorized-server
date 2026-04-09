@@ -1,0 +1,6 @@
+---
+version: 3
+tasks:
+  build: go build -ldflags="-w -s" -o server .
+  deploy: |-
+    scp server honeypot:
